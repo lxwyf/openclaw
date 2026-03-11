@@ -1,0 +1,577 @@
+# CLAUDE.md
+
+本文件为 Claude Code (claude.ai/code) 在此仓库中的工作提供指导。
+
+## 快速参考
+
+- **仓库**: https://github.com/openclaw/openclaw
+- **版本**: 2026.2.4 (dev) / 查看 `package.json` 和 `CHANGELOG.md`
+- **Node 基线**: ≥22.12.0
+- **包管理器**: pnpm（主要）、bun（脚本/开发）、Node（生产环境）
+- **语言**: TypeScript ESM，严格类型检查
+- **GitHub**: 使用字面多行字符串或 `-F - <<'EOF'`（或 `$'...'`）处理真实换行符；勿使用 `\\n`
+
+## 高层架构
+
+OpenClaw 是一个**个人 AI 助手平台**，具有基于 WebSocket 的控制平面（Gateway）和多个客户端界面：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Gateway (WebSocket @ 127.0.0.1:18789)                           │
+│ ├─ 消息路由 (channels → agents)                                  │
+│ ├─ 会话管理 (按用户/群组/工作区隔离)                              │
+│ ├─ 设备配对 (iOS/Android/macOS 节点)                             │
+│ ├─ 事件广播 (工具调用、推理、流)                                 │
+│ └─ HTTP 网络界面 (仪表板、WebChat、Canvas)                       │
+└─────────────────────────────────────────────────────────────────┘
+     ↑                                ↑                        ↑
+     │                                │                        │
+  CLI/开发    移动/macOS         外部消息          (扩展)
+  命令        节点（Canvas，      渠道            渠道
+             语音唤醒）                          插件
+```
+
+### 核心抽象
+
+1. **Agent 模块** (`src/agents/`) - 297 个文件，AI 执行引擎
+   - 生命周期: 配置 → 工作区 → 模型选择 → 工具执行 → 响应处理
+   - Pi-mono 集成 (0.52.5): RPC 模式 AI 代理，支持流式块
+   - 多代理支持: 主代理 + 可配置的子代理（如研究、编码）
+   - 工具系统: bash/文件/消息/渠道特定操作的统一 API
+   - 上下文管理: 自动压缩、令牌预算强制、基于 lane 的并发
+
+2. **渠道** (`src/{telegram,discord,slack,whatsapp,signal,imessage,web}/`) - 12+ 平台
+   - 适配器模式: 每个渠道实现通用接口（发送/接收/反应等）
+   - 扩展渠道在 `extensions/*` (BlueBubbles、Teams、Matrix、Zalo 等)
+   - 统一路由: 消息通过 `src/routing/` 流向代理，不受来源影响
+   - 消息元数据保留（发送者、群组、线程、媒体链接）
+
+3. **Gateway** (`src/gateway/`) - WebSocket 控制平面
+   - 客户端连接/认证 → 设备配对 → 消息分派 → 事件广播
+   - 无状态传输；设备令牌存储在 `~/.openclaw/nodes/paired.json`
+   - 支持本地（回环）、LAN（Bonjour）和远程（Tailscale）访问
+   - 事件系统: `device.pair.requested`、`message.incoming`、`tool.call` 等
+
+4. **配置系统** (`src/config/`) - 基于 JSON5，环境感知
+   - 位置: `~/.openclaw/openclaw.json`
+   - 支持多代理、按渠道覆盖、环境变量注入
+   - 通过 Zod schemas 进行验证
+   - 热重载: 配置变更大多无需重启 gateway（部分例外）
+
+5. **工作区** (`src/agents/`) - 持久化代理状态
+   - 位置: `~/.openclaw/workspace` 或 `~/.openclaw/workspace-{agentId}`
+   - 文件: `AGENTS.md`、`SOUL.md`、`TOOLS.md`、`IDENTITY.md`、`MEMORY.md`、`BOOTSTRAP.md`
+   - 作为代理的"文件系统大脑" – 在系统提示中引用
+   - 支持 git 集成进行版本控制
+
+### 请求流示例
+
+```
+用户发送 WhatsApp 消息
+  ↓
+Baileys (WhatsApp 适配器) 解析
+  ↓
+src/routing/router.ts 按渠道/群组/用户路由
+  ↓
+解析代理 (config.agents) + 会话范围
+  ↓
+src/agents/pi-embedded-runner/run.ts 执行:
+  1. 加载工作区文件 → 系统提示
+  2. 解析模型 + 认证（带失败转移）
+  3. 获取会话历史（可选自动压缩）
+  4. 通过 Pi-mono 运行时流式处理
+  5. 执行工具调用（bash/文件/消息等）
+  ↓
+响应块收集、去重、分块
+  ↓
+消息工具或直接回复到 WhatsApp
+```
+
+### 关键设计模式
+
+- **策略模式**: 工具访问、DM 范围、群组策略均可配置
+- **基于 Lane 的队列**: `src/agents/lanes.ts` – 按会话 lane + 全局 lane 防止竞态条件
+- **流式架构**: 消息块增量流式传输；客户端订阅实时更新
+- **失败转移级联**: 认证失败 → 尝试下一个 API 密钥/提供商；上下文溢出 → 压缩历史
+- **工作区隔离**: 每个代理拥有自己的目录；多工作区支持每台机器 >1 个机器人
+
+---
+
+## 构建、测试和开发
+
+### 常用命令
+
+```bash
+# 安装和设置
+pnpm install
+pnpm ui:build                           # 构建 Web UI 资源
+pnpm build                              # 完整构建: TS 编译 + UI 复制 + 元数据
+
+# 开发
+pnpm dev                                # 以开发模式运行 CLI
+pnpm gateway:watch                      # 监视 gateway，文件变更自动重启
+pnpm openclaw <cmd>                     # 直接运行 CLI 命令
+
+# 类型检查和 lint
+pnpm tsgo                               # 快速类型检查（无输出）
+pnpm check                              # 完整门控: tsgo + lint + format
+pnpm lint                               # 仅 Oxlint
+pnpm format                             # 仅 Oxfmt
+
+# 测试
+pnpm test                               # 运行所有测试（Vitest，并行）
+pnpm test:coverage                      # 覆盖率报告（70% 阈值：行/分支/函数/语句）
+pnpm test -- src/agents/model-auth.test.ts  # 运行单个测试文件
+pnpm test -- --run src/agents/model-auth.test.ts  # 单个测试，无监视模式
+pnpm test:live                          # 实时测试（需要 LIVE=1 或真实 API 密钥）
+pnpm test:docker:*                      # E2E Docker 测试（gateway、onboarding、models）
+
+# 平台特定构建
+pnpm mac:package                        # 构建 macOS 应用
+pnpm ios:run                            # 构建并运行 iOS 模拟器
+pnpm android:run                        # 构建并运行 Android 模拟器
+
+# UI 和文档
+pnpm ui:dev                             # Web UI 开发服务器（热重载）
+pnpm docs:bin                           # 生成 CLI 命令参考
+pnpm canvas:a2ui:bundle                 # 重建 A2UI Canvas 包
+```
+
+### 完整的提交前门控
+
+推送或提交前:
+
+```bash
+pnpm build && pnpm check && pnpm test
+```
+
+如果出现仅格式化的 diff，自动解决（暂存和未暂存）:
+
+```bash
+pnpm format
+git add <affected-files>
+```
+
+### 一次性开发模式
+
+**运行单个 Agent 测试文件**:
+```bash
+pnpm test -- src/agents/model-selection.test.ts --run
+```
+
+**本地调试 Pi 代理执行**:
+```bash
+# 1. 在 src/agents/pi-embedded-runner/run.ts 中添加日志
+// logDebug({ runAttempt, sessionMessages, toolResults });
+
+# 2. 用 stdio 运行测试
+pnpm test -- src/agents/pi-embedded-runner.test.ts --reporter=verbose
+
+# 3. 或直接运行 CLI
+pnpm openclaw agent --message "hello"
+```
+
+**重建并测试特定渠道**:
+```bash
+pnpm build
+pnpm openclaw channels status --probe  # 验证连接
+pnpm test -- src/telegram/  # 运行 Telegram 测试
+```
+
+**交互式配置编辑**:
+```bash
+openclaw config set channels.telegram.dm.policy open
+openclaw config get channels.telegram.dm
+openclaw config set gateway.bind 0.0.0.0  # 远程访问
+```
+
+---
+
+## 仓库指南
+
+## 项目结构和模块组织
+
+### 目录布局
+
+- `src/` - 主源代码
+  - `agents/` (297 个文件，46K+ 行代码) – AI 执行引擎：Pi-mono 集成、工具系统、模型认证/失败转移、会话管理、工作区生命周期
+  - `cli/` – 命令解析、帮助、进度旋转器
+  - `commands/` – 单个命令（agent、message、channels、config 等）
+  - `gateway/` – WebSocket 服务器、客户端协议、消息分派、设备配对
+  - `{telegram,discord,slack,whatsapp,signal,imessage,web}/` – 渠道适配器（统一接口）
+  - `channels/` – 共享路由、消息类型、媒体处理
+  - `routing/` – 消息路由逻辑（哪个代理、哪个会话范围）
+  - `config/` – 配置加载、验证（Zod）、环境替换
+  - `sessions/` – 会话状态管理和持久化
+  - `infra/` – OS 集成（二进制、端口、环境）
+  - `media/` – 媒体处理（图像、音频、视频、转录 hooks）
+  - `browser/` – 基于 Playwright 的浏览器控制工具
+  - `cron/` – 计划任务和自动化
+  - `terminal/` – CLI UI（表格、旋转器、调色板）
+  - `web/` – HTTP 服务器用于仪表板/WebChat/Canvas（基于 NextJS）
+  - `plugin-sdk/` – 插件系统 SDK
+  - `security/`、`pairing/`、`memory/` – 特定领域模块
+
+- `extensions/` – 官方渠道插件（30+）：BlueBubbles、Teams、Matrix、Zalo、语音通话等
+  - 每个都有自己的 `package.json`（deps 中无 `workspace:*`）；使用 jiti 别名导入 `openclaw/plugin-sdk`
+  - 安装在插件目录中运行 `npm install --omit=dev`
+
+- `apps/` – 平台应用
+  - `macos/` – SwiftUI macOS 应用（语音唤醒、菜单栏、控制）
+  - `ios/` – Swift iOS 应用（节点、canvas、语音唤醒）
+  - `android/` – Kotlin Android 应用
+
+- `docs/` – Mintlify 文档（相对根目录链接，无 `.md` 扩展名）
+  - `zh-CN/` – 自动生成的中文翻译；除非明确要求，否则不编辑
+  - `.i18n/` – 翻译词汇表、记忆、管道配置
+
+- `skills/` – 内置技能库（与发布版本打包）
+
+- `scripts/` – 构建、实用工具和发布脚本（查看 `scripts/committer` 用于提交）
+
+- 测试: 作为 `*.test.ts` 和 `*.e2e.test.ts` 并置
+- 构建输出: `dist/`
+
+### 重构共享逻辑时
+
+**消息渠道**: 始终考虑**所有**内置 + 扩展渠道。查看以下代码：
+- 核心渠道: `src/{telegram,discord,slack,signal,imessage,web}` + `src/routing`
+- 扩展: `extensions/*`（可能以不同方式实现相同接口）
+- 文档: `docs/channels/` + 提供商特定的路由/配对/命令文档
+- 标签覆盖: 添加新渠道/扩展时检查 `.github/labeler.yml`
+
+重构示例范围：DM 配对策略涉及路由、所有渠道适配器、配置验证、CLI、文档和扩展渠道。
+
+### 外部依赖
+
+- **安装程序**: 从 `https://openclaw.ai/*` 提供，位于兄弟仓库 `../openclaw.ai` (`public/install.sh`、`public/install-cli.sh`、`public/install.ps1`)
+- **扩展**: 在扩展 `package.json` 中保留仅插件的依赖；除非核心使用，否则不添加到根
+  - 避免在扩展 `dependencies` 中使用 `workspace:*`（破坏 npm 安装）；将 `openclaw` 放在 `devDependencies` 或 `peerDependencies` 中（运行时通过 jiti 别名解析 `openclaw/plugin-sdk`）
+
+---
+
+## Agent 模块深度指南
+
+Agent 模块（`src/agents/`）是执行引擎。理解其流程对大多数更改至关重要：
+
+### 配置 → 执行流
+
+```
+1. AgentScope 解析 (agent-scope.ts)
+   ├─ 加载 openclaw.json
+   ├─ 解析 agent ID（从配置或 CLI）
+   └─ 提取代理特定配置（模型、工具、工作区、身份）
+
+2. 工作区初始化 (workspace.ts)
+   ├─ 位置: ~/.openclaw/workspace（或 ~/.openclaw/workspace-{agentId}）
+   ├─ 加载 AGENTS.md、SOUL.md、TOOLS.md、IDENTITY.md、MEMORY.md
+   └─ 文件成为系统提示上下文
+
+3. 模型解析 (model-selection.ts + model-auth.ts)
+   ├─ 解析 "anthropic/claude-opus-4-6" 格式
+   ├─ 解析认证（来自 env、config 或认证配置文件存储的 API 密钥）
+   ├─ 支持认证配置文件轮换（OAuth、API 密钥、AWS SDK）
+   └─ 认证失败触发模型转移（级联到下一个提供商/密钥）
+
+4. Pi-Embedded 运行时 (pi-embedded-runner/run.ts)
+   ├─ 创建会话 lane（按会话密钥并发控制）
+   ├─ 构建系统提示（system-prompt.ts）及工作区上下文
+   ├─ 解析工具（pi-tools.ts: read/write/exec/message 等，按策略过滤）
+   ├─ 获取会话历史（可选自动压缩）
+   ├─ 通过 Pi-mono 运行时调用
+   └─ 使用工具调用处理流式响应块
+
+5. 工具执行 (bash-tools.exec.ts, pi-tools.ts)
+   ├─ 工具策略强制允许列表/拒绝列表
+   ├─ Bash 命令: 安全检查 → 批准流程 → PTY/进程执行
+   ├─ 文件操作: read/write/apply_patch 带沙箱检查
+   ├─ 消息工具: 跨渠道路由（Telegram、Discord 等）
+   └─ 去重消息以防止重复发送
+
+6. 响应处理 (pi-embedded-subscribe.ts)
+   ├─ 收集文本块（流式或最终）
+   ├─ 针对最近消息的去重
+   ├─ 按块分割（text_end、tool_call 断点）
+   ├─ 向 web UI/节点广播事件
+   └─ 将最终回复交付到源渠道
+```
+
+### 关键模式
+
+**基于 Lane 的并发**:
+- `src/agents/lanes.ts`: 按会话 lane + 全局 lane 队列
+- 防止工具执行和会话更新中的竞态条件
+- 示例：对同一 DM 范围的两条消息不会同时执行
+
+**认证配置文件轮换**:
+- `src/agents/auth-profiles/` + `auth-profiles.ts`
+- 每个提供商多个 API 密钥；失败时自动轮换
+- 冷却期以避免频繁尝试失败的密钥
+- 最后成功的配置文件优先
+
+**上下文窗口管理**:
+- `context-window-guard.ts`: 强制令牌预算
+- `compaction.ts`: 接近限制时自动修剪历史
+- Bootstrap 文件首先注入以确保工作区上下文
+
+**按策略过滤工具**:
+- `pi-tools.ts`: 每个工具都有名称（如 "exec"、"read"、"message"）
+- `tool-policy.ts`: 解析允许列表（支持通配符 "exec*"）
+- 子代理获得更严格的策略（默认为仅读工具）
+
+### 测试 Agent 变更
+
+```bash
+# 测试模型选择和认证
+pnpm test -- src/agents/model-selection.test.ts
+
+# 测试认证配置文件轮换
+pnpm test -- src/agents/auth-profiles.resolve-auth-profile-order.uses-stored-profiles-no-config-exists.test.ts
+
+# 测试 Pi 执行（模拟）
+pnpm test -- src/agents/pi-embedded-runner.test.ts
+
+# 测试工具策略过滤
+pnpm test -- src/agents/pi-tools.policy.ts
+
+# 测试 bash 工具执行
+pnpm test -- src/agents/bash-tools.exec.ts
+
+# 实时测试（需要 Anthropic API 密钥）
+CLAWDBOT_LIVE_TEST=1 pnpm test:live -- src/agents/
+```
+
+### 常见 Agent 相关任务
+
+**添加新工具**:
+1. 在 `pi-tools.ts` 中定义（schema + 处理程序）
+2. 添加到工具策略文档
+3. 用 `pnpm test -- src/agents/pi-tools.schema.ts` 测试
+4. 在 `system-prompt.ts` 中更新系统提示提示
+
+**添加工作区文件支持**:
+1. 在 `workspace.ts` 中定义路径
+2. 在 `system-prompt.ts` 中注入到系统提示
+3. 在 `docs/concepts/workspace.md` 中记录
+
+**修改代理执行流**:
+1. 从 `pi-embedded-runner/run.ts`（入口点）开始
+2. 检查 `lanes.ts` 中的 lane 队列
+3. 系统提示生成: `system-prompt.ts`
+4. 工具执行循环: `pi-embedded-subscribe.ts`
+
+---
+
+## 消息渠道开发
+
+添加或修改消息渠道时：
+
+### 渠道架构
+
+每个渠道实现通用接口：
+```typescript
+// 位置不同: src/telegram/*、src/discord/*、extensions/*/
+export interface ChannelAdapter {
+  send(message, options?) => Promise<SendResult>;
+  receive(update) => Promise<ReceivedMessage>;
+  react(messageId, reaction) => Promise<void>;
+  // + 平台特定方法
+}
+```
+
+### 集成点（检查清单）
+
+- [ ] **配置 schema** (`src/config/types.{channel}.ts`): 定义配置结构
+- [ ] **路由** (`src/routing/router.ts`): 将消息映射到代理/会话
+- [ ] **渠道适配器** (`src/{channel}/` 或 `extensions/{channel}/`): 实现发送/接收等
+- [ ] **消息类型** (`src/channels/message-types.ts`): 定义元数据（发送者、群组、媒体）
+- [ ] **媒体处理** (`src/media/`): 处理下载/上传
+- [ ] **DM 策略** (`src/config/types.base.ts`): 支持 DmPolicy ("open"、"pairing"、"allowlist"、"disabled")
+- [ ] **群组策略** (`src/config/types.base.ts`): 支持 GroupPolicy ("open"、"allowlist"、"disabled")
+- [ ] **命令门控** (`src/routing/`): 按渠道过滤命令
+- [ ] **向导集成** (`src/wizard/`): 添加渠道设置流程
+- [ ] **CLI 命令** (`src/commands/{channel}.ts`): 添加管理/登录等
+- [ ] **文档** (`docs/channels/{channel}.md`): 记录设置、功能、限制
+- [ ] **标签** (`.github/labeler.yml`): 添加自动分类标签
+- [ ] **扩展**: 如果不在 `src/` 中，确保 `extensions/{channel}/` 遵循插件模式
+
+### 快速开始：添加 Telegram 命令
+
+```bash
+# 1. 在 src/telegram/bot-handlers.ts 中实现处理程序
+export async function handleCommand(msg, context) {
+  if (msg.text?.startsWith("/mycommand")) {
+    // 你的逻辑
+  }
+}
+
+# 2. 添加到命令注册表
+// 在 bot.ts 或 bot-handlers.ts 中
+bot.command("mycommand", handleCommand);
+
+# 3. 测试
+pnpm test -- src/telegram/
+
+# 4. 更新文档
+# docs/channels/telegram.md → 添加命令参考
+```
+
+---
+
+## 文档链接 (Mintlify)
+
+- 文档托管在 Mintlify (docs.openclaw.ai)。
+- `docs/**/*.md` 中的内部文档链接: 相对根目录，无 `.md`/`.mdx`（示例: `[Config](/configuration)`）。
+- 部分交叉参考: 在相对根目录路径上使用锚点（示例: `[Hooks](/configuration#hooks)`）。
+- 文档标题和锚点: 避免在标题中使用破折号和撇号，因为它们会破坏 Mintlify 锚点链接。
+- 向用户提供链接时，使用完整的 `https://docs.openclaw.ai/...` 网址（非相对）。
+- 编辑文档时，在回复末尾附加 `https://docs.openclaw.ai/...` 网址。
+- README（GitHub）: 保持绝对文档网址 (`https://docs.openclaw.ai/...`)，以便链接在 GitHub 上正常工作。
+- 文档内容必须通用: 无个人设备名称/主机名/路径；使用占位符如 `user@gateway-host` 和"gateway host"。
+
+## 文档国际化 (zh-CN)
+
+- `docs/zh-CN/**` 是生成的；除非用户明确要求，否则不编辑。
+- 管道: 更新英文文档 → 调整词汇表 (`docs/.i18n/glossary.zh-CN.json`) → 运行 `scripts/docs-i18n` → 仅在指示时应用针对性修复。
+- 翻译记忆: `docs/.i18n/zh-CN.tm.jsonl`（生成）。
+- 查看 `docs/.i18n/README.md`。
+- 管道可能缓慢/低效；如有问题，在 Discord 上 ping @jospalmbier 而不是绕过。
+
+---
+
+## exe.dev VM 操作（常规）
+
+- 访问: 稳定路径是 `ssh exe.dev` 然后 `ssh vm-name`（假设 SSH 密钥已设置）。
+- SSH 不稳定: 使用 exe.dev 网络终端或 Shelley（网络代理）；为长期操作保持 tmux 会话。
+- 更新: `sudo npm i -g openclaw@latest`（全局安装在 `/usr/lib/node_modules` 上需要 root）。
+- 配置: 使用 `openclaw config set ...`；确保设置 `gateway.mode=local`。
+- Discord: 仅存储原始令牌（无 `DISCORD_BOT_TOKEN=` 前缀）。
+- 重启: 停止旧 gateway 并运行:
+  `pkill -9 -f openclaw-gateway || true; nohup openclaw gateway run --bind loopback --port 18789 --force > /tmp/openclaw-gateway.log 2>&1 &`
+- 验证: `openclaw channels status --probe`、`ss -ltnp | rg 18789`、`tail -n 120 /tmp/openclaw-gateway.log`。
+
+## 编码风格和命名约定
+
+- 语言: TypeScript (ESM)。优先使用严格类型；避免 `any`。
+- 通过 Oxlint 和 Oxfmt 进行格式化/linting；提交前运行 `pnpm check`。
+- 为棘手或非显而易见的逻辑添加简短代码注释。
+- 保持文件简洁；提取帮助程序而不是"V2"副本。使用现有的 CLI 选项和通过 `createDefaultDeps` 依赖注入的模式。
+- 目标是将文件保持在 ~700 行以下；仅是指导原则（不是硬限制）。在提高清晰度或可测试性时拆分/重构。
+- 命名: 在产品/应用/文档标题中使用 **OpenClaw**；在 CLI 命令、包/二进制、路径和配置密钥中使用 `openclaw`。
+
+## 发布渠道（命名）
+
+- stable: 仅标记发布（如 `vYYYY.M.D`），npm dist-tag `latest`。
+- beta: 预发布标签 `vYYYY.M.D-beta.N`，npm dist-tag `beta`（可能未发布 macOS 应用）。
+- dev: `main` 分支上移动头（无标签；git checkout main）。
+
+## 测试指南
+
+- 框架: Vitest 及 V8 覆盖率阈值（70% 行/分支/函数/语句）。
+- 命名: 源名称匹配 `*.test.ts`；e2e 为 `*.e2e.test.ts`。
+- 当修改逻辑时，在推送前运行 `pnpm test`（或 `pnpm test:coverage`）。
+- 不要将测试工作线程数设置超过 16；已尝试过。
+- 实时测试（真实密钥）: `CLAWDBOT_LIVE_TEST=1 pnpm test:live`（仅 OpenClaw）或 `LIVE=1 pnpm test:live`（包括提供商实时测试）。Docker: `pnpm test:docker:live-models`、`pnpm test:docker:live-gateway`。Onboarding Docker E2E: `pnpm test:docker:onboard`。
+- 完整工具包 + 覆盖内容: `docs/testing.md`。
+- 纯测试添加/修复通常**不**需要更改日志条目，除非它们改变了用户可见的行为或用户要求。
+- 移动: 使用模拟器前，检查已连接的真实设备（iOS + Android）并优先使用它们。
+
+## 提交和拉取请求指南
+
+- 使用 `scripts/committer "<msg>" <file...>` 创建提交；避免手动 `git add`/`git commit`，以保持暂存范围。
+- 遵循简洁、面向行动的提交消息（如 `CLI: add verbose flag to send`）。
+- 分组相关更改；避免捆绑不相关的重构。
+- 更改日志工作流: 在顶部保持最新发布版本（无 `Unreleased`）；发布后，进行版本提升并开始新的顶部部分。
+- PR 应总结范围、注明已执行的测试，并提及任何用户可见的更改或新标志。
+- 提交 PR 时阅读: `docs/help/submitting-a-pr.md`
+- 提交问题时阅读: `docs/help/submitting-an-issue.md`
+- PR 审查流: 通过 `gh pr view`/`gh pr diff` 审查；**不**切换分支。
+- PR 审查调用: 偏好单个 `gh pr view --json ...` 以批量元数据/注释；仅在需要时运行 `gh pr diff`。
+- 启动 PR 审查前：运行 `git pull`；如果有本地更改或未推送的提交，停止并在审查前提醒用户。
+- 目标: 合并 PR。优先使用**rebase**（提交清洁）；**squash**（历史混乱）。
+- PR 合并流: 从 `main` 创建临时分支，将 PR 分支合并到其中（干净提交时优先 rebase；复杂性/冲突时允许 merge）。始终尝试合并 PR，除非真的很困难。如果 squash，将 PR 作者添加为共同贡献者。应用修复，添加更改日志条目（包括 PR # + 感谢），在最终提交前运行完整门控，提交，合并回 `main`，删除临时分支，以 `main` 结束。
+- 如果审查 PR 后执行工作，通过 merge/squash 登陆（非直接主提交）并始终将 PR 作者添加为共同贡献者。
+- 在处理 PR 时：添加更改日志条目及 PR 编号和贡献者致谢。
+- 处理问题时：在更改日志条目中引用该问题。
+- 合并 PR 时：留下 PR 注释，准确说明我们做了什么并包括 SHA 哈希。
+- 从新贡献者合并 PR 时：将其头像添加到 README"感谢所有爪贡献者"缩略图列表。
+- 合并 PR 后：如果贡献者缺失，运行 `bun scripts/update-clawtributors.ts`，然后提交重新生成的 README。
+
+## 快捷命令
+
+- `sync`: 如果工作树有未清理状态，提交所有更改（选择合理的 Conventional Commit 消息），然后 `git pull --rebase`；如果 rebase 冲突且无法解决，停止；否则 `git push`。
+
+### PR 工作流（审查 vs 登陆）
+
+- **审查模式（仅 PR 链接）:** 读取 `gh pr view/diff`；**不**切换分支；**不**更改代码。
+- **登陆模式:** 从 `main` 创建集成分支，引入 PR 提交（**优先 rebase** 用于线性历史；复杂性/冲突时允许 **merge**），应用修复，添加更改日志（+ 感谢 + PR #），**本地提交前运行完整门控**（`pnpm build && pnpm check && pnpm test`），提交，合并回 `main`，然后 `git switch main`（登陆后永不停留在主题分支）。重要: 贡献者需要在 git 图中存在！
+
+## 安全和配置提示
+
+- Web 提供商在 `~/.openclaw/credentials/` 存储凭证；如果注销，重新运行 `openclaw login`。
+- Pi 会话默认位于 `~/.openclaw/sessions/`；基础目录不可配置。
+- 环境变量: 查看 `~/.profile`。
+- 切勿提交或发布真实电话号码、视频或实时配置值。在文档、测试和示例中使用明显的假占位符。
+- 发布流: 发布任何工作前始终读取 `docs/reference/RELEASING.md` 和 `docs/platforms/mac/release.md`；一旦这些文档回答了问题，就不要提出例行问题。
+
+## 故障排除
+
+- Rebrand/迁移问题或旧版配置/服务警告: 运行 `openclaw doctor`（查看 `docs/gateway/doctor.md`）。
+
+## Agent 特定注释
+
+- 词汇: "makeup" = "mac app"。
+- 勿编辑 `node_modules`（全局/Homebrew/npm/git 安装也是）。更新会覆盖。技能说明放在 `tools.md` 或 `AGENTS.md`。
+- Signal: "update fly" => `fly ssh console -a flawd-bot -C "bash -lc 'cd /data/clawd/openclaw && git pull --rebase origin main'"` 然后 `fly machines restart e825232f34d058 -a flawd-bot`。
+- 处理 GitHub Issue 或 PR 时，在任务末尾打印完整网址。
+- 回答问题时，仅提供高置信度答案：验证代码；勿猜测。
+- 切勿更新 Carbon 依赖。
+- 具有 `pnpm.patchedDependencies` 的任何依赖必须使用精确版本（无 `^`/`~`）。
+- 修补依赖（pnpm 补丁、覆盖或供应商更改）需要显式批准；默认不执行此操作。
+- CLI 进度: 使用 `src/cli/progress.ts`（`osc-progress` + `@clack/prompts` 旋转器）；不要手动创建旋转器/进度条。
+- 状态输出: 保持表格 + ANSI 安全包装（`src/terminal/table.ts`）；`status --all` = 只读/可粘贴，`status --deep` = 探针。
+- Gateway 目前仅作为菜单栏应用运行；未安装单独的 LaunchAgent/帮助标签。通过 OpenClaw Mac 应用或 `scripts/restart-mac.sh` 重启；要验证/杀死，使用 `launchctl print gui/$UID | grep openclaw` 而不是假设固定标签。**在 macOS 上调试时，通过应用启动/停止 gateway，而不是临时 tmux 会话；在移交前杀死任何临时隧道。**
+- macOS 日志: 使用 `./scripts/clawlog.sh` 查询 OpenClaw 子系统的统一日志；它支持 follow/tail/category 过滤并期望对 `/usr/bin/log` 的无密码 sudo。
+- 如果本地有共享护栏，审查它们；否则遵循此仓库的指导。
+- SwiftUI 状态管理（iOS/macOS）: 优先使用 `Observation` 框架（`@Observable`、`@Bindable`）胜过 `ObservableObject`/`@StateObject`；除非兼容性需要，否则不引入新 `ObservableObject`，在修改相关代码时迁移现有用法。
+- 连接提供商: 添加新连接时，更新每个 UI 界面和文档（macOS 应用、Web UI、移动（如适用）、onboarding/概览文档）并添加匹配的状态 + 配置表单，以使提供商列表和设置保持同步。
+- 版本位置: `package.json`（CLI）、`apps/android/app/build.gradle.kts`（versionName/versionCode）、`apps/ios/Sources/Info.plist` + `apps/ios/Tests/Info.plist`（CFBundleShortVersionString/CFBundleVersion）、`apps/macos/Sources/OpenClaw/Resources/Info.plist`（CFBundleShortVersionString/CFBundleVersion）、`docs/install/updating.md`（固定 npm 版本）、`docs/platforms/mac/release.md`（APP_VERSION/APP_BUILD 示例）、Peekaboo Xcode 项目/Info.plists（MARKETING_VERSION/CURRENT_PROJECT_VERSION）。
+- **重启应用:** "重启 iOS/Android 应用"意味着重建（重新编译/安装）和重新启动，而不仅仅是杀死/启动。
+- **设备检查:** 测试前，在考虑模拟器/仿真器之前验证已连接的真实设备（iOS/Android）。
+- iOS Team ID 查找: `security find-identity -p codesigning -v` → 使用 Apple Development (...) TEAMID。备选: `defaults read com.apple.dt.Xcode IDEProvisioningTeamIdentifiers`。
+- A2UI 包哈希: `src/canvas-host/a2ui/.bundle.hash` 是自动生成的；忽略意外更改，仅在需要时通过 `pnpm canvas:a2ui:bundle`（或 `scripts/bundle-a2ui.sh`）重新生成。将哈希作为单独提交提交。
+- 发布签名/公证密钥在仓库外管理；遵循内部发布文档。
+- 公证认证 env 变量（`APP_STORE_CONNECT_ISSUER_ID`、`APP_STORE_CONNECT_KEY_ID`、`APP_STORE_CONNECT_API_KEY_P8`）预期在您的环境中（根据内部发布文档）。
+- **多代理安全:** 除非明确要求，否则**不**创建/应用/删除 `git stash` 条目（包括 `git pull --rebase --autostash`）。假设其他代理可能正在工作；保持不相关的 WIP 不动并避免跨切的状态更改。
+- **多代理安全:** 当用户说"push"时，您可以 `git pull --rebase` 集成最新更改（切勿丢弃其他代理的工作）。当用户说"commit"时，范围仅限您的更改。当用户说"commit all"时，以分组块提交所有内容。
+- **多代理安全:** 除非明确要求，否则**不**创建/移除/修改 `git worktree` 检出（或编辑 `.worktrees/*`）。
+- **多代理安全:** 除非明确要求，否则**不**切换分支/检出不同分支。
+- **多代理安全:** 只要每个代理有自己的会话，运行多个代理没问题。
+- **多代理安全:** 看到无法识别的文件时，继续前进；专注于您的更改并仅提交这些。
+- Lint/format 变动:
+  - 如果暂存+未暂存 diff 仅是格式化，自动解决而无需询问。
+  - 如果已请求提交/推送，自动暂存并在同一提交中包括仅格式化的后续操作（或如果需要，是个小后续提交），无需额外确认。
+  - 仅在更改是语义的（逻辑/数据/行为）时询问。
+- Lobster seam: 在 `src/terminal/palette.ts` 中使用共享 CLI 调色板（无硬编码颜色）；应用调色板到 onboarding/配置提示和其他 TTY UI 输出。
+- **多代理安全:** 关注您的编辑的报告；避免护栏免责声明除非真的被阻止；当多个代理修改同一文件时，如果安全继续；仅在相关时以简要"其他文件存在"说明结尾。
+- Bug 调查: 在得出结论前阅读相关 npm 依赖项和所有相关本地代码的源代码；目标是高置信度根本原因。
+- 代码风格: 为棘手逻辑添加简短注释；在可行时将文件保持在 ~500 行以下（需要时拆分/重构）。
+- 工具 schema 护栏（google-antigravity）: 避免在工具输入 schema 中使用 `Type.Union`；无 `anyOf`/`oneOf`/`allOf`。对字符串列表使用 `stringEnum`/`optionalStringEnum`（Type.Unsafe enum），并用 `Type.Optional(...)` 代替 `... | null`。保持顶级工具 schema 为 `type: "object"`，带 `properties`。
+- 工具 schema 护栏: 避免在工具 schema 中使用原始 `format` 属性名；某些验证器将 `format` 视为保留关键字并拒绝 schema。
+- 被要求打开"会话"文件时，打开 Pi 会话日志在 `~/.openclaw/agents/<agentId>/sessions/*.jsonl`（使用系统提示中 Runtime 行的 `agent=<id>` 值；最新除非指定特定 ID），而非默认 `sessions.json`。如果需要来自另一台机器的日志，通过 Tailscale SSH 并读取相同路径。
+- 勿在 SSH 上重建 macOS 应用；重建必须直接在 Mac 上运行。
+- 切勿将流式/部分回复发送到外部消息界面（WhatsApp、Telegram）；仅最终回复应传递到那里。流式/工具事件可能仍然前往内部 UI/控制渠道。
+- 语音唤醒转发提示:
+  - 命令模板应保持 `openclaw-mac agent --message "${text}" --thinking low`；`VoiceWakeForwarder` 已 shell-转义 `${text}`。不要添加额外引号。
+  - launchd PATH 最小；确保应用的启动代理 PATH 包括标准系统路径加上您的 pnpm bin（通常 `$HOME/Library/pnpm`），以便通过 `openclaw-mac` 调用时 `pnpm`/`openclaw` 二进制文件解析。
+- 对于包含 `!` 的手动 `openclaw message send` 消息，使用下面注明的 heredoc 模式以避免 Bash 工具的转义。
+- 发布护栏: 未经操作员明确同意勿更改版本号；在运行任何 npm publish/release 步骤前始终要求权限。
+
+## NPM + 1Password（发布/验证）
+
+- 使用 1password skill；所有 `op` 命令必须在新鲜 tmux 会话中运行。
+- 登录: `eval "$(op signin --account my.1password.com)"`（应用解锁 + 集成开启）。
+- OTP: `op read 'op://Private/Npmjs/one-time password?attribute=otp'`。
+- 发布: `npm publish --access public --otp="<otp>"`（从包目录运行）。
+- 验证无本地 npmrc 副作用: `npm view <pkg> version --userconfig "$(mktemp)"`。
+- 发布后杀死 tmux 会话。

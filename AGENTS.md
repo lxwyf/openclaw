@@ -1,25 +1,421 @@
-# Repository Guidelines
+# CLAUDE.md
 
-- Repo: https://github.com/openclaw/openclaw
-- GitHub issues/comments/PR comments: use literal multiline strings or `-F - <<'EOF'` (or $'...') for real newlines; never embed "\\n".
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Quick Reference
+
+- **Repo**: https://github.com/openclaw/openclaw
+- **Version**: 2026.2.4 (dev) / see `package.json` and `CHANGELOG.md`
+- **Node baseline**: ≥22.12.0
+- **Package manager**: pnpm (also supports bun for scripts/dev; Node for production)
+- **Language**: TypeScript ESM, strict typing
+- **GitHub**: Use literal multiline strings or `-F - <<'EOF'` (or `$'...'`) for real newlines; never embed `\\n`
+
+## High-Level Architecture
+
+OpenClaw is a **personal AI assistant platform** with a WebSocket-based control plane (Gateway) and multiple client surfaces:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Gateway (WebSocket @ 127.0.0.1:18789)                           │
+│ ├─ Message routing (channels → agents)                           │
+│ ├─ Session management (per-user/group/workspace isolation)       │
+│ ├─ Device pairing (iOS/Android/macOS nodes)                      │
+│ ├─ Event broadcasting (tool calls, thinking, streams)            │
+│ └─ HTTP web surfaces (Dashboard, WebChat, Canvas)                │
+└─────────────────────────────────────────────────────────────────┘
+     ↑                                ↑                        ↑
+     │                                │                        │
+  CLI/Dev    Mobile/macOS         External           (Extensions)
+  Commands   Nodes (Canvas,        Messaging         Channel
+             Voice Wake)           Channels          Plugins
+```
+
+### Core Abstractions
+
+1. **Agents** (`src/agents/`) - 297 files, AI execution engine
+   - Lifecycle: configuration → workspace → model selection → tool execution → response handling
+   - Pi-mono integration (0.52.5): RPC-mode AI agent with streaming blocks
+   - Multi-agent support: main agent + configurable subagents (e.g., research, coding)
+   - Tool system: unified API for bash/files/messaging/channel-specific operations
+   - Context management: automatic compaction, token budget enforcement, lane-based concurrency
+
+2. **Channels** (`src/{telegram,discord,slack,whatsapp,signal,imessage,web}/`) - 12+ platforms
+   - Adapter pattern: each channel implements common interface (send/receive/react/etc.)
+   - Extension channels in `extensions/*` (BlueBubbles, Teams, Matrix, Zalo, etc.)
+   - Unified routing: messages flow through `src/routing/` to agents regardless of source
+   - Message metadata preservation (sender, group, thread, media links)
+
+3. **Gateway** (`src/gateway/`) - WebSocket control plane
+   - Client connect/auth → device pairing → message dispatch → event broadcast
+   - Stateless transport; device tokens stored in `~/.openclaw/nodes/paired.json`
+   - Supports local (loopback), LAN (Bonjour), and remote (Tailscale) access
+   - Event system: `device.pair.requested`, `message.incoming`, `tool.call`, etc.
+
+4. **Configuration** (`src/config/`) - JSON5-based, environment-aware
+   - Location: `~/.openclaw/openclaw.json`
+   - Supports multi-agent, per-channel overrides, environment variable injection
+   - Validation via Zod schemas
+   - Hot-reload: config changes apply without gateway restart (mostly)
+
+5. **Workspace** (`src/agents/`) - persistent agent state
+   - Location: `~/.openclaw/workspace` or `~/.openclaw/workspace-{agentId}`
+   - Files: `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `MEMORY.md`, `BOOTSTRAP.md`
+   - Acts as agent's "filesystem brain" – referenced in system prompts
+   - Supports git integration for version control
+
+### Request Flow Example
+
+```
+User sends WhatsApp message
+  ↓
+Baileys (WhatsApp adapter) parses it
+  ↓
+src/routing/router.ts routes by channel/group/user
+  ↓
+Resolves agent (config.agents) + session scope
+  ↓
+src/agents/pi-embedded-runner/run.ts executes:
+  1. Load workspace files → system prompt
+  2. Resolve model + auth (with failover)
+  3. Fetch session history (optional compaction)
+  4. Stream through Pi-mono runtime
+  5. Execute tool calls (bash/files/message/etc.)
+  ↓
+Response blocks collected, deduplicated, chunked
+  ↓
+Message tool or direct reply back to WhatsApp
+```
+
+### Key Design Patterns
+
+- **Policy pattern**: Tool access, DM scope, group policies all configurable
+- **Lane-based queueing**: `src/agents/lanes.ts` – per-session lanes + global lane prevent race conditions
+- **Streaming architecture**: Message blocks streamed incrementally; clients subscribe for real-time updates
+- **Failover cascading**: Auth failure → try next API key/provider; context overflow → compress history
+- **Workspace isolation**: Each agent gets its own directory; multi-workspace supports >1 bot per machine
+
+---
+
+## Build, Test, and Development
+
+### Common Commands
+
+```bash
+# Install & setup
+pnpm install
+pnpm ui:build                           # Build Web UI assets
+pnpm build                              # Full build: TS compile + UI copy + metadata
+
+# Development
+pnpm dev                                # Run CLI in dev mode (pnpm openclaw ...)
+pnpm gateway:watch                      # Watch gateway, auto-restart on changes
+pnpm openclaw <cmd>                     # Run CLI commands directly
+
+# Type-check & lint
+pnpm tsgo                               # Quick type check (no emit)
+pnpm check                              # Full gate: tsgo + lint + format
+pnpm lint                               # Oxlint only
+pnpm format                             # Oxfmt only
+
+# Testing
+pnpm test                               # Run all tests (Vitest, parallel)
+pnpm test:coverage                      # Coverage report (70% threshold: lines/branches/functions/statements)
+pnpm test -- src/agents/model-auth.test.ts  # Run single test file
+pnpm test -- --run src/agents/model-auth.test.ts  # Single test, no watch
+pnpm test:live                          # Live tests (needs LIVE=1 or real API keys)
+pnpm test:docker:*                      # E2E Docker tests (gateway, onboarding, models)
+
+# Platform-specific builds
+pnpm mac:package                        # Build macOS app
+pnpm ios:run                            # Build & run iOS simulator
+pnpm android:run                        # Build & run Android emulator
+
+# UI & docs
+pnpm ui:dev                             # Dev server for Web UI (hot reload)
+pnpm docs:bin                           # Generate CLI command reference
+pnpm canvas:a2ui:bundle                 # Rebuild A2UI Canvas bundles
+```
+
+### Full Pre-Commit Gate
+
+Before pushing or committing:
+
+```bash
+pnpm build && pnpm check && pnpm test
+```
+
+If formatting-only diffs appear, auto-resolve (staged + unstaged):
+
+```bash
+pnpm format
+git add <affected-files>
+```
+
+### One-Off Development Patterns
+
+**Run a single Agent test file**:
+```bash
+pnpm test -- src/agents/model-selection.test.ts --run
+```
+
+**Debug Pi agent execution locally**:
+```bash
+# 1. Add logging in src/agents/pi-embedded-runner/run.ts
+// logDebug({ runAttempt, sessionMessages, toolResults });
+
+# 2. Run test with stdio
+pnpm test -- src/agents/pi-embedded-runner.test.ts --reporter=verbose --reporter=default
+
+# 3. Or run CLI directly
+pnpm openclaw agent --message "hello"
+```
+
+**Rebuild and test a specific channel**:
+```bash
+pnpm build
+pnpm openclaw channels status --probe  # Verify connectivity
+pnpm test -- src/telegram/  # Run Telegram tests
+```
+
+**Interactive config editing**:
+```bash
+openclaw config set channels.telegram.dm.policy open
+openclaw config get channels.telegram.dm
+openclaw config set gateway.bind 0.0.0.0  # Remote access
+```
+
+---
+
+## Repository Guidelines
 
 ## Project Structure & Module Organization
 
-- Source code: `src/` (CLI wiring in `src/cli`, commands in `src/commands`, web provider in `src/provider-web.ts`, infra in `src/infra`, media pipeline in `src/media`).
-- Tests: colocated `*.test.ts`.
-- Docs: `docs/` (images, queue, Pi config). Built output lives in `dist/`.
-- Plugins/extensions: live under `extensions/*` (workspace packages). Keep plugin-only deps in the extension `package.json`; do not add them to the root `package.json` unless core uses them.
-- Plugins: install runs `npm install --omit=dev` in plugin dir; runtime deps must live in `dependencies`. Avoid `workspace:*` in `dependencies` (npm install breaks); put `openclaw` in `devDependencies` or `peerDependencies` instead (runtime resolves `openclaw/plugin-sdk` via jiti alias).
-- Installers served from `https://openclaw.ai/*`: live in the sibling repo `../openclaw.ai` (`public/install.sh`, `public/install-cli.sh`, `public/install.ps1`).
-- Messaging channels: always consider **all** built-in + extension channels when refactoring shared logic (routing, allowlists, pairing, command gating, onboarding, docs).
-  - Core channel docs: `docs/channels/`
-  - Core channel code: `src/telegram`, `src/discord`, `src/slack`, `src/signal`, `src/imessage`, `src/web` (WhatsApp web), `src/channels`, `src/routing`
-  - Extensions (channel plugins): `extensions/*` (e.g. `extensions/msteams`, `extensions/matrix`, `extensions/zalo`, `extensions/zalouser`, `extensions/voice-call`)
-- When adding channels/extensions/apps/docs, review `.github/labeler.yml` for label coverage.
+### Directoy Layout
 
-## Docs Linking (Mintlify)
+- `src/` - Main source code
+  - `agents/` (297 files, 46K+ LOC) – AI execution engine: Pi-mono integration, tool system, model auth/failover, session management, workspace lifecycle
+  - `cli/` – Command parsing, help, progress spinners
+  - `commands/` – Individual commands (agent, message, channels, config, etc.)
+  - `gateway/` – WebSocket server, client protocol, message dispatch, device pairing
+  - `{telegram,discord,slack,whatsapp,signal,imessage,web}/` – Channel adapters (unified interface)
+  - `channels/` – Shared routing, message types, media handling
+  - `routing/` – Message routing logic (which agent, which session scope)
+  - `config/` – Configuration loading, validation (Zod), environment substitution
+  - `sessions/` – Session state management and persistence
+  - `infra/` – OS integration (binaries, ports, environment)
+  - `media/` – Media processing (images, audio, video, transcription hooks)
+  - `browser/` – Playwright-based browser control for tools
+  - `cron/` – Scheduled tasks and automation
+  - `terminal/` – CLI UI (tables, spinners, palette)
+  - `web/` – HTTP server for Dashboard/WebChat/Canvas (NextJS-based)
+  - `plugin-sdk/` – Plugin system SDK
+  - `security/`, `pairing/`, `memory/` – Domain-specific modules
 
-- Docs are hosted on Mintlify (docs.openclaw.ai).
+- `extensions/` – Official channel plugins (30+): BlueBubbles, Teams, Matrix, Zalo, Voice Call, etc.
+  - Each has own `package.json` (no `workspace:*` in deps); uses jiti alias to import `openclaw/plugin-sdk`
+  - Install runs `npm install --omit=dev` in plugin dir
+
+- `apps/` – Platform applications
+  - `macos/` – SwiftUI macOS app (voice wake, menubar, control)
+  - `ios/` – Swift iOS app (nodes, canvas, voice wake)
+  - `android/` – Kotlin Android app
+
+- `docs/` – Mintlify documentation (root-relative links, no `.md` extension)
+  - `zh-CN/` – Auto-generated Chinese translations; do not edit unless explicitly asked
+  - `.i18n/` – Translation glossary, memory, pipeline config
+
+- `skills/` – Built-in skill library (bundled with release)
+
+- `scripts/` – Build, utility, and release scripts (see `scripts/committer` for commits)
+
+- Tests: colocated as `*.test.ts` and `*.e2e.test.ts`
+- Built output: `dist/`
+
+### When Refactoring Shared Logic
+
+**Messaging channels**: always consider **all** built-in + extension channels. Review code in:
+- Core channels: `src/{telegram,discord,slack,signal,imessage,web}` + `src/routing`
+- Extensions: `extensions/*` (may implement same interface differently)
+- Docs: `docs/channels/` + provider-specific routing/pairing/command docs
+- Label coverage: check `.github/labeler.yml` when adding new channels/extensions
+
+Example refactor scope: DM pairing policy touches routing, all channel adapters, config validation, CLI, docs, and extension channels.
+
+### External Dependencies
+
+- **Installers**: served from `https://openclaw.ai/*`, live in sibling repo `../openclaw.ai` (`public/install.sh`, `public/install-cli.sh`, `public/install.ps1`)
+- **Extensions**: keep plugin-only deps in extension `package.json`; do not add to root unless core uses them
+  - Avoid `workspace:*` in extension `dependencies` (breaks npm install); put `openclaw` in `devDependencies` or `peerDependencies` instead
+  - Runtime resolves `openclaw/plugin-sdk` via jiti alias
+
+## Agent Module Deep Dive
+
+The Agent module (`src/agents/`) is the execution engine. Understanding its flow is critical for most changes:
+
+### Configuration → Execution Flow
+
+```
+1. AgentScope Resolution (agent-scope.ts)
+   ├─ Load openclaw.json
+   ├─ Resolve agent ID (from config or CLI)
+   └─ Extract agent-specific config (model, tools, workspace, identity)
+
+2. Workspace Initialization (workspace.ts)
+   ├─ Location: ~/.openclaw/workspace (or ~/.openclaw/workspace-{agentId})
+   ├─ Load AGENTS.md, SOUL.md, TOOLS.md, IDENTITY.md, MEMORY.md
+   └─ Files become system prompt context
+
+3. Model Resolution (model-selection.ts + model-auth.ts)
+   ├─ Parse "anthropic/claude-opus-4-6" format
+   ├─ Resolve auth (API key from env, config, or auth profile store)
+   ├─ Support auth profile rotation (OAuth, API keys, AWS SDK)
+   └─ Auth failures trigger model failover (cascade to next provider/key)
+
+4. Pi-Embedded Runner (pi-embedded-runner/run.ts)
+   ├─ Create session lane (per-sessionKey concurrency control)
+   ├─ Build system prompt (system-prompt.ts) with workspace context
+   ├─ Resolve tools (pi-tools.ts: read/write/exec/message/etc., filtered by policy)
+   ├─ Fetch session history (with optional auto-compaction)
+   ├─ Call Pi-mono runtime in RPC mode
+   └─ Stream response blocks with tool call handling
+
+5. Tool Execution (bash-tools.exec.ts, pi-tools.ts)
+   ├─ Tool policies enforce allowlist/denylists
+   ├─ Bash commands: security check → approve flow → PTY/process exec
+   ├─ File operations: read/write/apply_patch with sandbox checks
+   ├─ Message tool: route across channels (Telegram, Discord, etc.)
+   └─ Deduplicate messaging to prevent duplicate sends
+
+6. Response Handling (pi-embedded-subscribe.ts)
+   ├─ Collect text blocks (streaming or final)
+   ├─ Deduplicate against recent messages
+   ├─ Split into chunks (text_end, tool_call breakpoints)
+   ├─ Broadcast events to web UI / nodes
+   └─ Deliver final reply to source channel
+```
+
+### Key Patterns
+
+**Lane-based Concurrency**:
+- `src/agents/lanes.ts`: per-session lanes + global lane queue
+- Prevents race conditions in tool execution and session updates
+- Example: two messages to same DM scope won't execute simultaneously
+
+**Auth Profile Rotation**:
+- `src/agents/auth-profiles/` + `auth-profiles.ts`
+- Multiple API keys per provider; automatic rotation on failure
+- Cooldown periods to avoid hammering failed keys
+- Last-good profile prioritized
+
+**Context Window Management**:
+- `context-window-guard.ts`: enforce token budget
+- `compaction.ts`: auto-prune history when approaching limit
+- Bootstrap files injected first to ensure workspace context
+
+**Tool Filtering by Policy**:
+- `pi-tools.ts`: each tool has name (e.g., "exec", "read", "message")
+- `tool-policy.ts`: resolve allowlist (supports wildcards "exec*")
+- Subagents get stricter policies (read-only tools by default)
+
+### Testing Agent Changes
+
+```bash
+# Test model selection & auth
+pnpm test -- src/agents/model-selection.test.ts
+
+# Test auth profile rotation
+pnpm test -- src/agents/auth-profiles.resolve-auth-profile-order.uses-stored-profiles-no-config-exists.test.ts
+
+# Test Pi execution (mocked)
+pnpm test -- src/agents/pi-embedded-runner.test.ts
+
+# Test tool policy filtering
+pnpm test -- src/agents/pi-tools.policy.ts
+
+# Test bash tool execution
+pnpm test -- src/agents/bash-tools.exec.ts
+
+# Live test (needs Anthropic API key)
+CLAWDBOT_LIVE_TEST=1 pnpm test:live -- src/agents/
+```
+
+### Common Agent-Related Tasks
+
+**Add a new tool**:
+1. Define in `pi-tools.ts` (schema + handler)
+2. Add to tool policy docs
+3. Test with `pnpm test -- src/agents/pi-tools.schema.ts`
+4. Update system prompt hints in `system-prompt.ts`
+
+**Add workspace file support**:
+1. Define path in `workspace.ts`
+2. Inject into system prompt in `system-prompt.ts`
+3. Document in `docs/concepts/workspace.md`
+
+**Modify agent execution flow**:
+1. Start in `pi-embedded-runner/run.ts` (entry point)
+2. Check lane queueing in `lanes.ts`
+3. System prompt generation: `system-prompt.ts`
+4. Tool execution loop: `pi-embedded-subscribe.ts`
+
+---
+
+## Messaging Channel Development
+
+When adding or modifying a messaging channel:
+
+### Channel Architecture
+
+Each channel implements a common interface:
+```typescript
+// Location varies: src/telegram/*, src/discord/*, extensions/*/
+export interface ChannelAdapter {
+  send(message, options?) => Promise<SendResult>;
+  receive(update) => Promise<ReceivedMessage>;
+  react(messageId, reaction) => Promise<void>;
+  // + platform-specific methods
+}
+```
+
+### Integration Points (Checklist)
+
+- [ ] **Config schema** (`src/config/types.{channel}.ts`): Define config structure
+- [ ] **Routing** (`src/routing/router.ts`): Map messages to agents/sessions
+- [ ] **Channel adapter** (`src/{channel}/` or `extensions/{channel}/`): Implement send/receive/etc.
+- [ ] **Message types** (`src/channels/message-types.ts`): Define metadata (sender, group, media)
+- [ ] **Media handling** (`src/media/`): Handle downloads/uploads
+- [ ] **DM policy** (`src/config/types.base.ts`): Support DmPolicy ("open", "pairing", "allowlist", "disabled")
+- [ ] **Group policy** (`src/config/types.base.ts`): Support GroupPolicy ("open", "allowlist", "disabled")
+- [ ] **Command gating** (`src/routing/`): Filter commands by channel
+- [ ] **Onboarding** (`src/wizard/`): Add channel setup flow
+- [ ] **CLI commands** (`src/commands/{channel}.ts`): Add manage/login/etc.
+- [ ] **Docs** (`docs/channels/{channel}.md`): Document setup, features, limitations
+- [ ] **Labels** (`.github/labeler.yml`): Add label for auto-categorization
+- [ ] **Extension**: If not in `src/`, ensure `extensions/{channel}/` follows plugin patterns
+
+### Quick Start: Add a Telegram Command
+
+```bash
+# 1. Implement handler in src/telegram/bot-handlers.ts
+export async function handleCommand(msg, context) {
+  if (msg.text?.startsWith("/mycommand")) {
+    // your logic
+  }
+}
+
+# 2. Add to command registry
+// In bot.ts or bot-handlers.ts
+bot.command("mycommand", handleCommand);
+
+# 3. Test
+pnpm test -- src/telegram/
+
+# 4. Update docs
+# docs/channels/telegram.md → add command reference
+```
+
+---
 - Internal doc links in `docs/**/*.md`: root-relative, no `.md`/`.mdx` (example: `[Config](/configuration)`).
 - Section cross-references: use anchors on root-relative paths (example: `[Hooks](/configuration#hooks)`).
 - Doc headings and anchors: avoid em dashes and apostrophes in headings because they break Mintlify anchor links.
